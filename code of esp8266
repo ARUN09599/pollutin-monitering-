@@ -1,0 +1,483 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+
+// ==========================================
+// 1. HARDWARE PIN & NETWORK CONFIGURATION
+// ==========================================
+const char* ssid1     = "TECNO POVA 7 5G";
+const char* password1 = "123456798";
+const char* ssid2     = "realme C21";
+const char* password2 = ""; 
+
+#define MQ135_PIN A0   // MQ-135 Gas Sensor
+#define DHTPIN    D4   // DHT11 Sensor
+#define DHTTYPE   DHT11
+
+#define BUZZER_PIN D5  // Active/Passive Buzzer Pin
+#define RED_PIN    D6  // RGB Red
+#define GREEN_PIN  D7  // RGB Green
+#define BLUE_PIN   D3  // RGB Blue
+
+#define SDA_PIN    D2  // LCD I2C SDA Pin
+#define SCL_PIN    D1  // LCD I2C SCL Pin
+
+const bool IS_COMMON_ANODE = false; 
+
+DHT dht(DHTPIN, DHTTYPE);
+ESP8266WebServer server(80);
+LiquidCrystal_I2C *lcd = NULL;
+
+// ==========================================
+// 2. SYSTEM STATE VARIABLES
+// ==========================================
+int globalSensorVal = 0;
+int baselineVal = 0;
+int estimatedPPM = 0; 
+
+int alarmPPMThreshold = 300; 
+int buzzerToneSpeed = 150;   
+bool alarmMuted = false;
+unsigned long lastBuzzerToggle = 0;
+bool buzzerState = false;
+
+// Dynamic Volume Level (0 to 100%)
+int buzzerVolume = 100; 
+
+float tempC = 0.0;     
+float humidity = 0.0;  
+float feelsLikeC = 0.0;
+
+String pollutionStatus = "CALIBRATING";
+String comfortStatus = "CALCULATING";
+
+unsigned long lastDHTReadTime = 0;
+unsigned long lastLCDUpdate = 0;
+int lcdDisplayPage = 0;
+
+// High Pitch Octaves for Piezo Peak Output
+#define NOTE_E7  2637
+#define NOTE_G7  3136
+#define NOTE_A7  3520
+#define NOTE_B7  3951
+#define NOTE_C8  4186
+#define NOTE_D8  4699
+
+// ==========================================
+// 3. HELPER & RGB CONTROL FUNCTIONS
+// ==========================================
+void setRGB(int red, int green, int blue) {
+  if (IS_COMMON_ANODE) {
+    analogWrite(RED_PIN, 255 - red);
+    analogWrite(GREEN_PIN, 255 - green);
+    analogWrite(BLUE_PIN, 255 - blue);
+  } else {
+    analogWrite(RED_PIN, red);
+    analogWrite(GREEN_PIN, green);
+    analogWrite(BLUE_PIN, blue);
+  }
+}
+
+// Volume-Controlled Tone Player
+void playCustomTone(int pin, unsigned int frequency, unsigned long duration) {
+  if (buzzerVolume <= 0 || alarmMuted) {
+    noTone(pin);
+    digitalWrite(pin, LOW);
+    delay(duration);
+    return;
+  }
+
+  // Modulate duty cycle according to global volume slider (10% to 100%)
+  unsigned long period = 1000000 / frequency;
+  unsigned long highTime = (period * buzzerVolume) / 100;
+  unsigned long lowTime = period - highTime;
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < duration) {
+    digitalWrite(pin, HIGH);
+    delayMicroseconds(highTime);
+    digitalWrite(pin, LOW);
+    delayMicroseconds(lowTime);
+  }
+}
+
+void triggerSuccessGlow() {
+  for (int cycle = 0; cycle < 2; cycle++) {
+    for (int i = 0; i <= 255; i += 5) {
+      setRGB(0, i, 0); 
+      delay(8);
+    }
+    for (int i = 255; i >= 0; i -= 5) {
+      setRGB(0, i, 0); 
+      delay(8);
+    }
+  }
+  setRGB(0, 255, 0);
+}
+
+float computeFeelsLike(float T, float R) {
+  if (T < 20.0) return T;
+  return -8.784695 + 1.61139411 * T + 2.33854883 * R - 0.14611605 * T * R - 0.01230809 * T * T;
+}
+
+void updateComfortStatus() {
+  if (humidity < 35.0) comfortStatus = "Too Dry";
+  else if (humidity > 70.0) comfortStatus = "Too Humid";
+  else if (tempC >= 20.0 && tempC <= 26.0 && humidity >= 40.0 && humidity <= 60.0) comfortStatus = "Optimal";
+  else comfortStatus = "Moderate";
+}
+
+void initLCD() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+  byte lcdAddress = 0x00;
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      if (address == 0x27 || address == 0x3F) { lcdAddress = address; break; }
+    }
+  }
+  if (lcdAddress != 0x00) {
+    lcd = new LiquidCrystal_I2C(lcdAddress, 16, 2);
+    lcd->init();
+    lcd->backlight();
+  }
+}
+
+void playStartupAnimation() {
+  if (!lcd) return;
+  
+  lcd->clear();
+  lcd->setCursor(0, 0); lcd->print("   Powered by   ");
+  lcd->setCursor(0, 1); lcd->print(" @Aruncreation  ");
+  delay(2000);
+
+  lcd->clear();
+  lcd->setCursor(0, 0); lcd->print(" Project Owner: ");
+  lcd->setCursor(0, 1); lcd->print("     Vivek      ");
+  delay(2000);
+  
+  lcd->clear();
+}
+
+// =======================================================
+// CALIBRATION & MELODY ROUTINE
+// =======================================================
+void playDBossCalibration() {
+  if (lcd) { lcd->clear(); lcd->setCursor(0, 0); lcd->print("Air Calibration"); }
+
+  int melody[] = {
+    NOTE_E7, NOTE_G7, NOTE_A7, NOTE_A7, NOTE_G7, NOTE_A7, NOTE_C8, NOTE_B7,
+    NOTE_A7, NOTE_G7, NOTE_E7, NOTE_G7, NOTE_A7, NOTE_E7, NOTE_D8, NOTE_C8
+  };
+  int noteDurations[] = {
+    180, 180, 250, 180, 180, 250, 180, 180,
+    250, 180, 180, 250, 200, 200, 200, 300
+  };
+
+  long sum = 0;
+  int totalSteps = sizeof(melody) / sizeof(melody[0]);
+
+  for (int i = 0; i < totalSteps; i++) {
+    sum += analogRead(MQ135_PIN);
+
+    if (i % 5 == 0) setRGB(255, 0, 0);         
+    else if (i % 5 == 1) setRGB(255, 255, 0);  
+    else if (i % 5 == 2) setRGB(0, 255, 0);    
+    else if (i % 5 == 3) setRGB(0, 255, 255);  
+    else setRGB(255, 0, 255);                  
+
+    playCustomTone(BUZZER_PIN, melody[i], noteDurations[i]);
+
+    if (lcd) {
+      lcd->setCursor(0, 1);
+      lcd->print("Progress: ");
+      lcd->print(((i + 1) * 100) / totalSteps);
+      lcd->print("%  ");
+    }
+
+    delay(noteDurations[i] * 0.2);
+  }
+
+  baselineVal = sum / totalSteps;
+  
+  if (lcd) { 
+    lcd->clear(); 
+    lcd->setCursor(0, 0); 
+    lcd->print("     Ready      "); 
+    delay(1000); 
+    lcd->clear(); 
+  }
+}
+
+// ==========================================
+// 4. DASHBOARD HTML SENDER (WITH VOLUME SLIDER)
+// ==========================================
+void handleRoot() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+
+  server.sendContent(F("<!DOCTYPE html><html><head>"));
+  server.sendContent(F("<meta name='viewport' content='width=device-width, initial-scale=1.0'>"));
+  server.sendContent(F("<title>Air Quality Analytics Dashboard</title>"));
+  server.sendContent(F("<style>"));
+  server.sendContent(F("body { font-family: 'Segoe UI', sans-serif; background: #161821; color: #a0a5ba; margin: 0; padding: 20px; display: flex; justify-content: center; }"));
+  server.sendContent(F(".dashboard { background: #1e202d; border-radius: 16px; padding: 24px; width: 100%; max-width: 850px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }"));
+  server.sendContent(F(".header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }"));
+  server.sendContent(F(".title { font-size: 18px; font-weight: 600; color: #fff; }"));
+  server.sendContent(F(".chart-container { position: relative; width: 100%; height: 220px; margin-bottom: 20px; }"));
+  server.sendContent(F("canvas#lineChart { width: 100%; height: 100%; }"));
+  server.sendContent(F(".gauges-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; align-items: center; text-align: center; margin-bottom: 20px; }"));
+  server.sendContent(F(".gauge-card { display: flex; flex-direction: column; align-items: center; }"));
+  server.sendContent(F(".gauge-val { font-size: 18px; font-weight: 700; color: #fff; margin-top: -52px; margin-bottom: 34px; }"));
+  server.sendContent(F(".gauge-label { font-size: 11px; font-weight: 600; color: #5a5f78; margin-top: 5px; }"));
+  server.sendContent(F(".volume-box { background: #26293b; border: 1px solid #363a52; border-radius: 12px; padding: 15px; margin-bottom: 20px; text-align: center; }"));
+  server.sendContent(F(".volume-title { font-size: 12px; font-weight: 600; color: #22d3ee; text-transform: uppercase; margin-bottom: 10px; }"));
+  server.sendContent(F(".slider { width: 80%; height: 8px; border-radius: 5px; background: #363a52; outline: none; accent-color: #22d3ee; cursor: pointer; }"));
+  server.sendContent(F(".info-section { display: grid; grid-template-columns: 1fr; gap: 15px; margin-bottom: 20px; }"));
+  server.sendContent(F(".info-card { background: #26293b; border: 1px solid #363a52; border-radius: 12px; padding: 15px; }"));
+  server.sendContent(F(".info-title { font-size: 12px; font-weight: 600; color: #22d3ee; text-transform: uppercase; margin-bottom: 8px; }"));
+  server.sendContent(F(".info-content { font-size: 13px; color: #fff; font-weight: 500; line-height: 1.4; }"));
+  server.sendContent(F(".controls { display: flex; justify-content: center; gap: 12px; border-top: 1px solid #2a2d3d; padding-top: 18px; flex-wrap: wrap; }"));
+  server.sendContent(F(".btn { background: #26293b; color: #a0a5ba; border: 1px solid #363a52; padding: 9px 16px; border-radius: 8px; text-decoration: none; font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; }"));
+  server.sendContent(F(".btn:hover { background: #32364e; color: #fff; border-color: #22d3ee; }"));
+  server.sendContent(F("</style></head><body>"));
+
+  server.sendContent(F("<div class='dashboard'>"));
+  server.sendContent(F("<div class='header'><div class='title'>Air Quality Monitor - @Aruncreation | Owner: Vivek</div></div>"));
+  server.sendContent(F("<div class='chart-container'><canvas id='lineChart'></canvas></div>"));
+  server.sendContent(F("<div class='gauges-grid'>"));
+  server.sendContent(F("<div class='gauge-card'><canvas id='pieChart' width='90' height='90'></canvas><div class='gauge-label'>Composition</div></div>"));
+  server.sendContent(F("<div class='gauge-card'><canvas id='gauge1' width='90' height='90'></canvas><div class='gauge-val' id='ppmVal'>0</div><div class='gauge-label'>PPM Level</div></div>"));
+  server.sendContent(F("<div class='gauge-card'><canvas id='gauge2' width='90' height='90'></canvas><div class='gauge-val' id='tempVal'>0C</div><div class='gauge-label'>Sensor Temp</div></div>"));
+  server.sendContent(F("<div class='gauge-card'><canvas id='gauge3' width='90' height='90'></canvas><div class='gauge-val' id='humVal'>0%</div><div class='gauge-label'>Sensor Humidity</div></div>"));
+  server.sendContent(F("</div>"));
+
+  // Web Dashboard Volume Adjuster
+  server.sendContent(F("<div class='volume-box'>"));
+  server.sendContent(F("<div class='volume-title'>Buzzer Volume Control: <span id='volText'>100</span>%</div>"));
+  server.sendContent(F("<input type='range' min='0' max='100' value='"));
+  server.sendContent(String(buzzerVolume));
+  server.sendContent(F("' class='slider' id='volSlider' onchange='setVolume(this.value)'>"));
+  server.sendContent(F("</div>"));
+
+  server.sendContent(F("<div class='info-section'>"));
+  server.sendContent(F("<div class='info-card'><div class='info-title'>Local Hardware Diagnostic</div><div class='info-content' id='adviceText'>Checking local hardware sensors...</div></div>"));
+  server.sendContent(F("</div>"));
+
+  server.sendContent(F("<div class='controls'>"));
+  server.sendContent(F("<button class='btn' onclick=\"sendAction('/recalibrate')\">Calibrate Zero</button>"));
+  server.sendContent(F("<button class='btn' onclick=\"sendAction('/toggleMute')\">Toggle Alarm</button>"));
+  server.sendContent(F("<button class='btn' onclick=\"sendAction('/testBuzzer')\">Test Buzzer</button>"));
+  server.sendContent(F("</div></div>"));
+
+  server.sendContent(F("<script>"));
+  server.sendContent(F("const lineCanvas = document.getElementById('lineChart'); const ctx = lineCanvas.getContext('2d');"));
+  server.sendContent(F("lineCanvas.width = lineCanvas.clientWidth; lineCanvas.height = lineCanvas.clientHeight;"));
+  server.sendContent(F("let historyPPM = new Array(12).fill(0);"));
+  server.sendContent(F("let historyTemp = new Array(12).fill(0);"));
+  server.sendContent(F("let historyHum = new Array(12).fill(0);"));
+  server.sendContent(F("function drawSpline(data, color, shadowColor, maxVal) {"));
+  server.sendContent(F("ctx.save(); ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.shadowColor = shadowColor; ctx.shadowBlur = 8;"));
+  server.sendContent(F("const step = lineCanvas.width / (data.length - 1);"));
+  server.sendContent(F("ctx.moveTo(0, lineCanvas.height - (data[0] / maxVal * lineCanvas.height));"));
+  server.sendContent(F("for (let i = 0; i < data.length - 1; i++) {"));
+  server.sendContent(F("const x1 = i * step, y1 = lineCanvas.height - (data[i] / maxVal * lineCanvas.height);"));
+  server.sendContent(F("const x2 = (i + 1) * step, y2 = lineCanvas.height - (data[i + 1] / maxVal * lineCanvas.height);"));
+  server.sendContent(F("const cx = (x1 + x2) / 2; ctx.bezierCurveTo(cx, y1, cx, y2, x2, y2); }"));
+  server.sendContent(F("ctx.stroke(); ctx.restore(); }"));
+  server.sendContent(F("function renderLineChart() {"));
+  server.sendContent(F("ctx.clearRect(0, 0, lineCanvas.width, lineCanvas.height); ctx.strokeStyle = '#26293b'; ctx.lineWidth = 1;"));
+  server.sendContent(F("for(let i = 1; i < 5; i++) { ctx.beginPath(); ctx.moveTo(0, i * lineCanvas.height / 5); ctx.lineTo(lineCanvas.width, i * lineCanvas.height / 5); ctx.stroke(); }"));
+  server.sendContent(F("drawSpline(historyPPM, '#22c55e', 'rgba(34, 197, 94, 0.6)', 500);"));
+  server.sendContent(F("drawSpline(historyTemp, '#06b6d4', 'rgba(6, 182, 212, 0.6)', 50);"));
+  server.sendContent(F("drawSpline(historyHum, '#8b5cf6', 'rgba(139, 92, 246, 0.6)', 100); }"));
+  server.sendContent(F("function drawGauge(canvasId, percent, color) {"));
+  server.sendContent(F("const c = document.getElementById(canvasId); const cx = c.getContext('2d');"));
+  server.sendContent(F("cx.clearRect(0, 0, 90, 90); cx.beginPath(); cx.arc(45, 45, 35, 0, 2 * Math.PI); cx.strokeStyle = '#26293b'; cx.lineWidth = 8; cx.stroke();"));
+  server.sendContent(F("cx.beginPath(); cx.arc(45, 45, 35, -Math.PI/2, (-Math.PI/2) + (2 * Math.PI * (percent / 100)));"));
+  server.sendContent(F("cx.strokeStyle = color; cx.lineWidth = 8; cx.lineCap = 'round'; cx.stroke(); }"));
+  server.sendContent(F("function drawPie(ppmVal, humVal) {"));
+  server.sendContent(F("const c = document.getElementById('pieChart'); const cx = c.getContext('2d');"));
+  server.sendContent(F("cx.clearRect(0, 0, 90, 90); let total = ppmVal + humVal + 1; if(total <= 1) total = 1;"));
+  server.sendContent(F("let slices = [ppmVal / total, humVal / total, 1 / total]; let colors = ['#22c55e', '#8b5cf6', '#06b6d4']; let start = 0;"));
+  server.sendContent(F("slices.forEach((slice, i) => { cx.beginPath(); cx.moveTo(45, 45); cx.arc(45, 45, 38, start, start + (slice * 2 * Math.PI)); cx.fillStyle = colors[i]; cx.fill(); start += slice * 2 * Math.PI; });"));
+  server.sendContent(F("cx.beginPath(); cx.arc(45, 45, 16, 0, 2 * Math.PI); cx.fillStyle = '#1e202d'; cx.fill(); }"));
+  server.sendContent(F("function sendAction(url) { fetch(url).catch(err => console.log(err)); }"));
+  server.sendContent(F("function setVolume(val) {"));
+  server.sendContent(F("document.getElementById('volText').innerText = val;"));
+  server.sendContent(F("fetch('/setVolume?val=' + val).catch(err => console.log(err)); }"));
+  server.sendContent(F("function updateDashboard() {"));
+  server.sendContent(F("fetch('/api/data').then(r => r.json()).then(data => {"));
+  server.sendContent(F("historyPPM.shift(); historyPPM.push(data.ppm);"));
+  server.sendContent(F("historyTemp.shift(); historyTemp.push(data.temp);"));
+  server.sendContent(F("historyHum.shift(); historyHum.push(data.hum);"));
+  server.sendContent(F("renderLineChart(); drawPie(data.ppm, data.hum);"));
+  server.sendContent(F("let ppmPct = Math.min(100, Math.round((data.ppm / 500) * 100));"));
+  server.sendContent(F("let tempPct = Math.min(100, Math.round((data.temp / 50) * 100));"));
+  server.sendContent(F("let humPct = Math.min(100, Math.round(data.hum));"));
+  server.sendContent(F("drawGauge('gauge1', ppmPct, '#22c55e'); document.getElementById('ppmVal').innerText = data.ppm;"));
+  server.sendContent(F("drawGauge('gauge2', tempPct, '#8b5cf6'); document.getElementById('tempVal').innerText = data.temp + 'C';"));
+  server.sendContent(F("drawGauge('gauge3', humPct, '#06b6d4'); document.getElementById('humVal').innerText = data.hum + '%';"));
+  server.sendContent(F("let advice = 'Air Quality: ' + data.status;"));
+  server.sendContent(F("if (data.temp == 0 && data.hum == 0) advice = 'WARNING: DHT11 sensor not detected! Check D4 wiring.';"));
+  server.sendContent(F("document.getElementById('adviceText').innerText = advice;"));
+  server.sendContent(F("}); }"));
+  server.sendContent(F("setInterval(updateDashboard, 2000); renderLineChart(); drawPie(0, 0); updateDashboard();"));
+  server.sendContent(F("</script></body></html>"));
+
+  server.sendContent(""); 
+}
+
+// ==========================================
+// 5. SETUP ROUTINE
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  analogWriteRange(255); 
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BLUE_PIN, OUTPUT);
+
+  digitalWrite(BUZZER_PIN, LOW);
+  setRGB(0, 0, 0);
+
+  initLCD();
+  playStartupAnimation();
+
+  dht.begin();
+
+  WiFi.begin(ssid1, password1);
+  int attempt = 0;
+  while (WiFi.status() != WL_CONNECTED && attempt < 10) { delay(500); attempt++; }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(ssid2, password2);
+    attempt = 0;
+    while (WiFi.status() != WL_CONNECTED && attempt < 10) { delay(500); attempt++; }
+  }
+
+  playDBossCalibration();
+  triggerSuccessGlow();
+
+  server.on("/", handleRoot);
+
+  server.on("/api/data", []() {
+    String json = "{\"ppm\":" + String(estimatedPPM) + 
+                  ",\"temp\":" + String(tempC, 1) + 
+                  ",\"hum\":" + String(humidity, 1) + 
+                  ",\"status\":\"" + pollutionStatus + "\"}";
+    server.send(200, "application/json", json);
+  });
+
+  // Web API endpoint to adjust volume slider dynamically
+  server.on("/setVolume", []() {
+    if (server.hasArg("val")) {
+      buzzerVolume = server.arg("val").toInt();
+      if (buzzerVolume < 0) buzzerVolume = 0;
+      if (buzzerVolume > 100) buzzerVolume = 100;
+    }
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/toggleMute", []() {
+    alarmMuted = !alarmMuted;
+    noTone(BUZZER_PIN);
+    digitalWrite(BUZZER_PIN, LOW);
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/testBuzzer", []() {
+    playCustomTone(BUZZER_PIN, 2700, 300);
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/recalibrate", []() {
+    playDBossCalibration();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+}
+
+// ==========================================
+// 6. MAIN LOOP
+// ==========================================
+void loop() {
+  server.handleClient();
+
+  globalSensorVal = analogRead(MQ135_PIN);
+  int pollutionDelta = globalSensorVal - baselineVal;
+  if (pollutionDelta < 0) pollutionDelta = 0;
+  estimatedPPM = map(pollutionDelta, 0, 400, 0, 500);
+
+  if (millis() - lastDHTReadTime >= 2500) {
+    lastDHTReadTime = millis();
+    float readH = dht.readHumidity();
+    float readT = dht.readTemperature();
+    
+    if (isnan(readH) || isnan(readT)) {
+      Serial.println("ERROR: Failed to read from DHT sensor! Check wiring on pin D4.");
+      tempC = 0.0;
+      humidity = 0.0;
+    } else {
+      humidity = readH; 
+      tempC = readT;
+      feelsLikeC = computeFeelsLike(tempC, humidity);
+      updateComfortStatus();
+    }
+  }
+
+  if (lcd && (millis() - lastLCDUpdate > 3000)) {
+    lcdDisplayPage = (lcdDisplayPage + 1) % 4;
+    lastLCDUpdate = millis();
+    lcd->clear();
+  }
+
+  if (lcd) {
+    if (lcdDisplayPage == 0) {
+      lcd->setCursor(0, 0); lcd->print("PPM:"); lcd->print(estimatedPPM);
+      lcd->setCursor(0, 1); lcd->print("Status: "); lcd->print(pollutionStatus);
+    } else if (lcdDisplayPage == 1) {
+      lcd->setCursor(0, 0); lcd->print("Temp: "); lcd->print(tempC, 1); lcd->print(" C");
+      lcd->setCursor(0, 1); lcd->print("Hum:  "); lcd->print(humidity, 1); lcd->print(" %");
+    } else if (lcdDisplayPage == 2) {
+      lcd->setCursor(0, 0); lcd->print("Feels: "); lcd->print(feelsLikeC, 1); lcd->print(" C");
+      lcd->setCursor(0, 1); lcd->print("Comf: "); lcd->print(comfortStatus);
+    } else {
+      lcd->setCursor(0, 0); lcd->print("IP Address:");
+      lcd->setCursor(0, 1); lcd->print(WiFi.localIP());
+    }
+  }
+
+  // High Pollution Alarm logic affected by Volume Adjuster
+  if (estimatedPPM < 150) {
+    pollutionStatus = "Normal Air"; 
+    setRGB(0, 255, 0); 
+    noTone(BUZZER_PIN);
+    digitalWrite(BUZZER_PIN, LOW);
+  } else if (estimatedPPM < alarmPPMThreshold) {
+    pollutionStatus = "Moderate"; 
+    setRGB(255, 255, 0); 
+    noTone(BUZZER_PIN);
+    digitalWrite(BUZZER_PIN, LOW);
+  } else {
+    pollutionStatus = "High Pollution!"; 
+    setRGB(255, 0, 0); 
+    if (!alarmMuted && millis() - lastBuzzerToggle >= buzzerToneSpeed) {
+      lastBuzzerToggle = millis(); 
+      buzzerState = !buzzerState;
+      if (buzzerState) {
+        playCustomTone(BUZZER_PIN, 2700, 100);
+      } else {
+        digitalWrite(BUZZER_PIN, LOW);
+      }
+    }
+  }
+
+  delay(50);
+}
